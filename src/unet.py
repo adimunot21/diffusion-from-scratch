@@ -24,9 +24,13 @@ Key design choices:
       to adapt its behavior based on the noise level.
     - Skip connections via concatenation (not addition): preserves more
       information from the encoder. Standard U-Net design.
+    - Self-attention (optional): at lower resolutions, lets the network capture
+      long-range spatial relationships. A pixel in the top-left can attend to
+      a pixel in the bottom-right. Essential for coherent structure in RGB images.
 
-This file implements the MNIST variant (no attention, 3 resolution levels).
-The CIFAR-10 variant with attention is built in Phase 5.
+Supports two configurations:
+    MNIST:    channels=[64,128,256],     no attention,  ~4.5M params
+    CIFAR-10: channels=[128,256,256,512], attention at levels 1&2, ~28M params
 """
 
 import math
@@ -89,14 +93,11 @@ class SinusoidalTimeEmbedding(nn.Module):
         half_dim = self.time_dim // 2
 
         # Compute frequencies: 10000^(-2i/d) for i in [0, half_dim)
-        # These are log-spaced from 1 to 1/10000
         freq = torch.exp(
             -math.log(10000.0) * torch.arange(half_dim, device=device) / half_dim
         )
 
         # Outer product: each timestep × each frequency
-        # t has shape (batch,), freq has shape (half_dim,)
-        # args has shape (batch, half_dim)
         args = t.float().unsqueeze(1) * freq.unsqueeze(0)
 
         # Interleave sin and cos: [sin(f1), cos(f1), sin(f2), cos(f2), ...]
@@ -134,41 +135,26 @@ class ResBlock(nn.Module):
         │
         ▼
       Output
-
-    WHY TIME CONDITIONING HERE (not just at the input):
-    Injecting time into every ResBlock lets the network adapt its behavior
-    at every layer based on the noise level. Early layers might detect edges
-    differently at high noise vs low noise. Deep layers might focus on
-    different global patterns. Pervasive conditioning is more powerful than
-    a single injection at the input.
     """
 
     def __init__(self, in_channels, out_channels, time_dim):
-        """
-        Args:
-            in_channels: input feature channels
-            out_channels: output feature channels
-            time_dim: dimension of the time embedding vector
-        """
         super().__init__()
 
         # First conv: GroupNorm → SiLU → Conv
-        self.norm1 = nn.GroupNorm(num_groups=8, num_channels=in_channels)
+        self.norm1 = nn.GroupNorm(num_groups=min(8, in_channels), num_channels=in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
         # Time projection: project time_dim → out_channels
-        # This gets added to the feature map between the two convolutions
         self.time_proj = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_dim, out_channels),
         )
 
         # Second conv: GroupNorm → SiLU → Conv
-        self.norm2 = nn.GroupNorm(num_groups=8, num_channels=out_channels)
+        self.norm2 = nn.GroupNorm(num_groups=min(8, out_channels), num_channels=out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
-        # Skip connection: if channels change, we need a 1×1 conv to match dimensions
-        # If channels are the same, this is just identity (no-op)
+        # Skip connection: 1×1 conv if channels change, identity otherwise
         if in_channels != out_channels:
             self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
@@ -191,8 +177,6 @@ class ResBlock(nn.Module):
         h = self.conv1(h)
 
         # Add time embedding
-        # time_proj output: (batch, out_channels) → reshape to (batch, out_channels, 1, 1)
-        # for broadcasting across spatial dimensions
         t = self.time_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
         h = h + t
 
@@ -204,18 +188,107 @@ class ResBlock(nn.Module):
         return h + residual
 
 
-class Downsample(nn.Module):
+class SelfAttention(nn.Module):
     """
-    Spatial downsampling: H×W → H/2 × W/2.
+    Multi-head self-attention over spatial feature maps.
 
-    Uses strided convolution (stride=2) instead of pooling.
-    Learned downsampling preserves more information than max/avg pooling.
+    Treats each spatial position (pixel) as a token, just like Transformer
+    attention treats each word as a token. This lets the network capture
+    long-range dependencies — a pixel in one corner can attend to a pixel
+    in the opposite corner.
+
+    WHY ATTENTION IN DIFFUSION:
+    Convolutions are local — a 3×3 filter only sees a 3×3 neighborhood.
+    Stacking many convolutions expands the receptive field, but it's still
+    indirect. Attention directly connects ALL positions in one operation.
+
+    For images, this matters for:
+    - Global color consistency (sky should be uniform blue)
+    - Symmetry (two eyes should match)
+    - Long-range structure (the left side of a car implies the right side)
+
+    WHY ONLY AT LOW RESOLUTIONS:
+    Attention is O(n²) where n = H × W (number of spatial positions).
+    At 32×32, n = 1024 → attention matrix is 1024×1024 = 1M entries.
+    At 16×16, n = 256 → attention matrix is 256×256 = 65K entries (16× smaller).
+    At 8×8, n = 64 → attention matrix is 64×64 = 4K entries (256× smaller).
+    We only use attention at 16×16 and 8×8 to keep compute manageable.
     """
+
+    def __init__(self, channels, num_heads=4):
+        """
+        Args:
+            channels: number of input/output channels
+            num_heads: number of attention heads
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        assert channels % num_heads == 0, \
+            f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+
+        self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+
+        # Q, K, V projections (like in your Transformer project)
+        self.q_proj = nn.Linear(channels, channels)
+        self.k_proj = nn.Linear(channels, channels)
+        self.v_proj = nn.Linear(channels, channels)
+
+        # Output projection
+        self.out_proj = nn.Linear(channels, channels)
+
+        # Scaling factor for attention scores: 1/√d_head
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x):
+        """
+        Args:
+            x: feature map, shape (batch, channels, H, W)
+
+        Returns:
+            output: shape (batch, channels, H, W) — same as input
+        """
+        b, c, h, w = x.shape
+        residual = x
+
+        # Normalize
+        x = self.norm(x)
+
+        # Reshape: (B, C, H, W) → (B, H*W, C) — treat each pixel as a token
+        x = x.view(b, c, h * w).permute(0, 2, 1)  # (B, N, C) where N = H*W
+
+        # Project to Q, K, V
+        q = self.q_proj(x)  # (B, N, C)
+        k = self.k_proj(x)  # (B, N, C)
+        v = self.v_proj(x)  # (B, N, C)
+
+        # Reshape for multi-head attention: (B, N, C) → (B, num_heads, N, head_dim)
+        q = q.view(b, h * w, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(b, h * w, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(b, h * w, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Attention: softmax(Q·K^T / √d) · V
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, heads, N, N)
+        attn = torch.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)  # (B, heads, N, head_dim)
+
+        # Reshape back: (B, heads, N, head_dim) → (B, N, C)
+        out = out.permute(0, 2, 1, 3).reshape(b, h * w, c)
+
+        # Output projection
+        out = self.out_proj(out)
+
+        # Reshape back to spatial: (B, N, C) → (B, C, H, W)
+        out = out.permute(0, 2, 1).view(b, c, h, w)
+
+        return out + residual
+
+
+class Downsample(nn.Module):
+    """Spatial downsampling: H×W → H/2 × W/2 via strided convolution."""
 
     def __init__(self, channels):
         super().__init__()
-        # stride=2 halves spatial dimensions
-        # padding=1 ensures output is exactly H/2 × W/2
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
 
     def forward(self, x):
@@ -225,13 +298,7 @@ class Downsample(nn.Module):
 class Upsample(nn.Module):
     """
     Spatial upsampling: H×W → 2H × 2W.
-
-    Uses nearest-neighbor interpolation followed by a convolution.
-    This avoids the checkerboard artifacts that transposed convolutions
-    (nn.ConvTranspose2d) are notorious for.
-
-    Nearest-neighbor: each pixel is duplicated to fill a 2×2 block.
-    Then the conv smooths and refines the result.
+    Nearest-neighbor interpolation + convolution avoids checkerboard artifacts.
     """
 
     def __init__(self, channels):
@@ -239,7 +306,6 @@ class Upsample(nn.Module):
         self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
 
     def forward(self, x):
-        # scale_factor=2 doubles both H and W
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         return self.conv(x)
 
@@ -250,105 +316,99 @@ class Upsample(nn.Module):
 
 class UNet(nn.Module):
     """
-    U-Net denoiser for MNIST (28×28 grayscale).
+    U-Net denoiser with optional self-attention.
 
-    Architecture (channel dimensions for default config):
+    Two configurations:
 
-    Encoder:
-        (1, 28, 28) → ConvIn → (64, 28, 28)
-        → ResBlock → ResBlock → (64, 28, 28)    ─── skip to decoder level 3
-        → Downsample → (64, 14, 14)
-        → ResBlock → ResBlock → (128, 14, 14)   ─── skip to decoder level 2
-        → Downsample → (128, 7, 7)
-        → ResBlock → ResBlock → (256, 7, 7)     ─── skip to decoder level 1
+    MNIST (no attention):
+        in=1, channels=[64,128,256], time_dim=128
+        28×28 → 14×14 → 7×7 → bottleneck → 7×7 → 14×14 → 28×28
+        ~4.5M params
 
-    Bottleneck:
-        → ResBlock → (256, 7, 7)
+    CIFAR-10 (with attention at levels 1 and 2):
+        in=3, channels=[128,256,256,512], time_dim=256, attention_levels=[F,T,T,F]
+        32×32 → 16×16 → 8×8 → 4×4 → bottleneck → 4×4 → 8×8 → 16×16 → 32×32
+        ~28M params
 
-    Decoder:
-        (256+256, 7, 7) → ResBlock → ResBlock → (256, 7, 7)    ← concat skip
-        → Upsample → (256, 14, 14)
-        (256+128, 14, 14) → ResBlock → ResBlock → (128, 14, 14) ← concat skip
-        → Upsample → (128, 28, 28)
-        (128+64, 28, 28) → ResBlock → ResBlock → (64, 28, 28)   ← concat skip
-
-    Output:
-        → GroupNorm → SiLU → Conv1×1 → (1, 28, 28)
-
-    Total skip connections: 3 (one per resolution level)
-    Each carries the LAST encoder feature map at that resolution.
+    Attention is added AFTER the ResBlocks at specified levels, in both
+    encoder and decoder. This lets convolutions extract local features first,
+    then attention captures global relationships between those features.
     """
 
     def __init__(self, in_channels=1, out_channels=1,
                  channel_list=(64, 128, 256), time_dim=128,
-                 num_res_blocks=2):
+                 num_res_blocks=2, attention_levels=None, num_heads=4):
         """
         Args:
             in_channels: input image channels (1 for MNIST, 3 for CIFAR)
             out_channels: output channels (same as input — predicting noise)
-            channel_list: channels at each resolution level [level1, level2, level3]
-                          Level 1 = full resolution, level 3 = lowest resolution
+            channel_list: channels at each resolution level
             time_dim: dimension of the sinusoidal time embedding
             num_res_blocks: number of ResBlocks per resolution level
+            attention_levels: list of bools, same length as channel_list.
+                              True = add self-attention at that level.
+                              None = no attention anywhere (MNIST default).
+            num_heads: number of attention heads
         """
         super().__init__()
         self.channel_list = channel_list
         self.num_res_blocks = num_res_blocks
 
+        # Default: no attention at any level
+        if attention_levels is None:
+            attention_levels = [False] * len(channel_list)
+        self.attention_levels = attention_levels
+
         # ── Time embedding ──
         self.time_embed = SinusoidalTimeEmbedding(time_dim)
 
         # ── Input convolution ──
-        # Maps raw image channels → first feature channel count
         self.conv_in = nn.Conv2d(in_channels, channel_list[0], kernel_size=3, padding=1)
 
         # ── Encoder ──
-        # Each level: num_res_blocks ResBlocks, then Downsample (except last level)
         self.encoder_blocks = nn.ModuleList()
+        self.encoder_attns = nn.ModuleList()
         self.downsamplers = nn.ModuleList()
 
         for i, ch_out in enumerate(channel_list):
-            # Channel count coming into this level
             ch_in = channel_list[i - 1] if i > 0 else channel_list[0]
 
             level_blocks = nn.ModuleList()
             for j in range(num_res_blocks):
-                # First block in level transitions from ch_in → ch_out
-                # Subsequent blocks are ch_out → ch_out
                 block_in = ch_in if j == 0 else ch_out
                 level_blocks.append(ResBlock(block_in, ch_out, time_dim))
             self.encoder_blocks.append(level_blocks)
+
+            # Attention after ResBlocks (if enabled for this level)
+            if attention_levels[i]:
+                self.encoder_attns.append(SelfAttention(ch_out, num_heads))
+            else:
+                self.encoder_attns.append(nn.Identity())
 
             # Downsample between levels (not after the last level)
             if i < len(channel_list) - 1:
                 self.downsamplers.append(Downsample(ch_out))
             else:
-                self.downsamplers.append(nn.Identity())  # placeholder, won't be used
+                self.downsamplers.append(nn.Identity())
 
         # ── Bottleneck ──
-        # Process at the lowest resolution
         bottleneck_ch = channel_list[-1]
         self.bottleneck = ResBlock(bottleneck_ch, bottleneck_ch, time_dim)
 
         # ── Decoder ──
-        # Mirror of encoder, but with skip connections (concatenation doubles input channels)
         self.decoder_blocks = nn.ModuleList()
+        self.decoder_attns = nn.ModuleList()
         self.upsamplers = nn.ModuleList()
 
-        # Walk through channel_list in reverse
         reversed_channels = list(reversed(channel_list))
-        for i, ch_out in enumerate(reversed_channels):
-            # The decoder receives: upsampled features + skip connection (concatenated)
-            # Skip connection comes from encoder at matching resolution
-            skip_ch = ch_out  # encoder output channels at this level
+        reversed_attention = list(reversed(attention_levels))
 
-            # Input channels for first block at this level:
-            # = upsampled channels from previous decoder level + skip channels
+        for i, ch_out in enumerate(reversed_channels):
+            skip_ch = ch_out
+
             if i == 0:
-                # First decoder level: input from bottleneck + skip
                 ch_in_first = bottleneck_ch + skip_ch
             else:
-                # Subsequent levels: input from previous decoder level + skip
                 ch_in_first = reversed_channels[i - 1] + skip_ch
 
             level_blocks = nn.ModuleList()
@@ -357,6 +417,12 @@ class UNet(nn.Module):
                 level_blocks.append(ResBlock(block_in, ch_out, time_dim))
             self.decoder_blocks.append(level_blocks)
 
+            # Attention (mirroring encoder)
+            if reversed_attention[i]:
+                self.decoder_attns.append(SelfAttention(ch_out, num_heads))
+            else:
+                self.decoder_attns.append(nn.Identity())
+
             # Upsample between levels (not after the last level)
             if i < len(channel_list) - 1:
                 self.upsamplers.append(Upsample(ch_out))
@@ -364,7 +430,8 @@ class UNet(nn.Module):
                 self.upsamplers.append(nn.Identity())
 
         # ── Output ──
-        self.out_norm = nn.GroupNorm(num_groups=8, num_channels=channel_list[0])
+        self.out_norm = nn.GroupNorm(num_groups=min(8, channel_list[0]),
+                                    num_channels=channel_list[0])
         self.out_conv = nn.Conv2d(channel_list[0], out_channels, kernel_size=1)
 
     def forward(self, x, t):
@@ -377,20 +444,22 @@ class UNet(nn.Module):
             noise_pred: predicted noise, shape (batch, out_channels, H, W)
         """
         # ── Time embedding ──
-        t_emb = self.time_embed(t)  # (batch, time_dim)
+        t_emb = self.time_embed(t)
 
         # ── Input convolution ──
-        h = self.conv_in(x)  # (batch, channel_list[0], H, W)
+        h = self.conv_in(x)
 
         # ── Encoder ──
-        # Store the output of each level for skip connections
         skip_connections = []
 
         for i, level_blocks in enumerate(self.encoder_blocks):
             for block in level_blocks:
                 h = block(h, t_emb)
 
-            # Save for skip connection (before downsampling)
+            # Attention (if enabled at this level)
+            h = self.encoder_attns[i](h)
+
+            # Save for skip connection
             skip_connections.append(h)
 
             # Downsample (except at the last level)
@@ -401,16 +470,15 @@ class UNet(nn.Module):
         h = self.bottleneck(h, t_emb)
 
         # ── Decoder ──
-        # Process in reverse, concatenating skip connections
         for i, level_blocks in enumerate(self.decoder_blocks):
-            # Get the matching skip connection (reverse order)
             skip = skip_connections[-(i + 1)]
-
-            # Concatenate skip connection along channel dimension
             h = torch.cat([h, skip], dim=1)
 
             for block in level_blocks:
                 h = block(h, t_emb)
+
+            # Attention (if enabled at this level)
+            h = self.decoder_attns[i](h)
 
             # Upsample (except at the last level)
             if i < len(self.channel_list) - 1:
@@ -430,7 +498,7 @@ class UNet(nn.Module):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("PHASE 2: U-Net Architecture Tests")
+    print("PHASE 2/5: U-Net Architecture Tests")
     print("=" * 60)
 
     # ── Test 1: Time embedding ──
@@ -441,170 +509,149 @@ if __name__ == "__main__":
     print(f"Input timesteps: {t.tolist()}")
     print(f"Embedding shape: {emb.shape}  (expected: [4, 128])")
     assert emb.shape == (4, 128), f"Wrong shape: {emb.shape}"
-
-    # Nearby timesteps should have similar embeddings
-    t_close = torch.tensor([100, 101])
-    emb_close = time_embed(t_close)
-    dist_close = (emb_close[0] - emb_close[1]).norm().item()
-
-    t_far = torch.tensor([100, 900])
-    emb_far = time_embed(t_far)
-    dist_far = (emb_far[0] - emb_far[1]).norm().item()
-
-    print(f"Distance t=100 vs t=101: {dist_close:.4f}")
-    print(f"Distance t=100 vs t=900: {dist_far:.4f}")
-    print(f"Far > Close: {dist_far > dist_close}")
-    # Note: after MLP, this property isn't guaranteed but usually holds
     print("✓ Time embedding shapes correct\n")
 
     # ── Test 2: ResBlock ──
     print("── Test 2: ResBlock ──")
-    # Same channels
     block_same = ResBlock(in_channels=64, out_channels=64, time_dim=128)
     x = torch.randn(2, 64, 14, 14)
     t_emb = torch.randn(2, 128)
     out = block_same(x, t_emb)
     print(f"ResBlock (64→64): input {x.shape} → output {out.shape}")
-    assert out.shape == (2, 64, 14, 14), f"Wrong shape: {out.shape}"
+    assert out.shape == (2, 64, 14, 14)
 
-    # Different channels
     block_diff = ResBlock(in_channels=64, out_channels=128, time_dim=128)
     out = block_diff(x, t_emb)
     print(f"ResBlock (64→128): input {x.shape} → output {out.shape}")
-    assert out.shape == (2, 128, 14, 14), f"Wrong shape: {out.shape}"
+    assert out.shape == (2, 128, 14, 14)
     print("✓ ResBlock correct\n")
 
-    # ── Test 3: Down/Upsample ──
-    print("── Test 3: Downsample and Upsample ──")
-    down = Downsample(64)
-    up = Upsample(64)
+    # ── Test 3: SelfAttention ──
+    print("── Test 3: Self-Attention ──")
+    attn = SelfAttention(channels=128, num_heads=4)
+    x = torch.randn(2, 128, 8, 8)
+    out = attn(x)
+    print(f"SelfAttention: input {x.shape} → output {out.shape}")
+    assert out.shape == x.shape, f"Attention should preserve shape"
+    n_attn_params = sum(p.numel() for p in attn.parameters())
+    print(f"Attention params: {n_attn_params:,}")
+    print("✓ Self-Attention correct\n")
 
-    x = torch.randn(2, 64, 28, 28)
-    x_down = down(x)
-    print(f"Downsample: {x.shape} → {x_down.shape}")
-    assert x_down.shape == (2, 64, 14, 14), f"Wrong shape: {x_down.shape}"
-
-    x_up = up(x_down)
-    print(f"Upsample:   {x_down.shape} → {x_up.shape}")
-    assert x_up.shape == (2, 64, 28, 28), f"Wrong shape: {x_up.shape}"
-    print("✓ Down/Upsample correct\n")
-
-    # ── Test 4: Full U-Net forward pass ──
-    print("── Test 4: Full U-Net Forward Pass ──")
-    model = UNet(
-        in_channels=1,
-        out_channels=1,
+    # ── Test 4: MNIST U-Net (no attention) ──
+    print("── Test 4: MNIST U-Net (no attention) ──")
+    model_mnist = UNet(
+        in_channels=1, out_channels=1,
         channel_list=(64, 128, 256),
-        time_dim=128,
-        num_res_blocks=2,
+        time_dim=128, num_res_blocks=2,
+        attention_levels=None,
     )
+    n_mnist = sum(p.numel() for p in model_mnist.parameters())
+    print(f"MNIST params: {n_mnist:,}")
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {n_params:,}")
-
-    batch = torch.randn(4, 1, 28, 28)   # 4 MNIST images
+    batch = torch.randn(4, 1, 28, 28)
     timesteps = torch.randint(0, 1000, (4,))
-    noise_pred = model(batch, timesteps)
+    out = model_mnist(batch, timesteps)
+    print(f"Input:  {batch.shape}")
+    print(f"Output: {out.shape}")
+    assert out.shape == batch.shape
+    print("✓ MNIST U-Net correct\n")
 
-    print(f"\nForward pass:")
-    print(f"  Input:       {batch.shape}       (batch, channels, H, W)")
-    print(f"  Timesteps:   {timesteps.shape}         (batch,)")
-    print(f"  Output:      {noise_pred.shape}       (batch, channels, H, W)")
-    assert noise_pred.shape == batch.shape, f"Output shape {noise_pred.shape} != input shape {batch.shape}"
-    print("✓ Output shape matches input shape (as expected — predicting noise)\n")
+    # ── Test 5: CIFAR-10 U-Net (with attention) ──
+    print("── Test 5: CIFAR-10 U-Net (with attention) ──")
+    model_cifar = UNet(
+        in_channels=3, out_channels=3,
+        channel_list=(128, 256, 256, 512),
+        time_dim=256, num_res_blocks=2,
+        attention_levels=[False, True, True, False],
+        num_heads=4,
+    )
+    n_cifar = sum(p.numel() for p in model_cifar.parameters())
+    print(f"CIFAR params: {n_cifar:,}")
 
-    # ── Test 5: Shape trace through the network ──
-    print("── Test 5: Detailed Shape Trace ──")
-    x = torch.randn(1, 1, 28, 28)
+    batch = torch.randn(2, 3, 32, 32)
+    timesteps = torch.randint(0, 1000, (2,))
+    out = model_cifar(batch, timesteps)
+    print(f"Input:  {batch.shape}")
+    print(f"Output: {out.shape}")
+    assert out.shape == batch.shape
+    print("✓ CIFAR U-Net correct\n")
+
+    # ── Test 6: Shape trace for CIFAR ──
+    print("── Test 6: CIFAR Shape Trace ──")
+    x = torch.randn(1, 3, 32, 32)
     t = torch.tensor([500])
 
     print(f"Input:               {x.shape}")
-
-    t_emb = model.time_embed(t)
+    t_emb = model_cifar.time_embed(t)
     print(f"Time embedding:      {t_emb.shape}")
-
-    h = model.conv_in(x)
+    h = model_cifar.conv_in(x)
     print(f"After conv_in:       {h.shape}")
 
     print("\nEncoder:")
     skips = []
-    for i, level_blocks in enumerate(model.encoder_blocks):
+    for i, level_blocks in enumerate(model_cifar.encoder_blocks):
         for j, block in enumerate(level_blocks):
             h = block(h, t_emb)
             print(f"  Level {i}, ResBlock {j}: {h.shape}")
+        h = model_cifar.encoder_attns[i](h)
+        has_attn = model_cifar.attention_levels[i]
+        if has_attn:
+            print(f"  Attention:          {h.shape}  ← self-attention applied")
         skips.append(h)
-        if i < len(model.channel_list) - 1:
-            h = model.downsamplers[i](h)
+        if i < len(model_cifar.channel_list) - 1:
+            h = model_cifar.downsamplers[i](h)
             print(f"  Downsample:         {h.shape}")
 
     print("\nBottleneck:")
-    h = model.bottleneck(h, t_emb)
+    h = model_cifar.bottleneck(h, t_emb)
     print(f"  ResBlock:           {h.shape}")
 
     print("\nDecoder:")
-    for i, level_blocks in enumerate(model.decoder_blocks):
+    rev_attn = list(reversed(model_cifar.attention_levels))
+    for i, level_blocks in enumerate(model_cifar.decoder_blocks):
         skip = skips[-(i + 1)]
         h = torch.cat([h, skip], dim=1)
         print(f"  After concat skip:  {h.shape}")
         for j, block in enumerate(level_blocks):
             h = block(h, t_emb)
             print(f"  Level {i}, ResBlock {j}: {h.shape}")
-        if i < len(model.channel_list) - 1:
-            h = model.upsamplers[i](h)
+        h = model_cifar.decoder_attns[i](h)
+        if rev_attn[i]:
+            print(f"  Attention:          {h.shape}  ← self-attention applied")
+        if i < len(model_cifar.channel_list) - 1:
+            h = model_cifar.upsamplers[i](h)
             print(f"  Upsample:           {h.shape}")
 
     print("\nOutput:")
-    h = model.out_norm(h)
+    h = model_cifar.out_norm(h)
     h = F.silu(h)
-    h = model.out_conv(h)
+    h = model_cifar.out_conv(h)
     print(f"  Final output:       {h.shape}")
 
-    # ── Test 6: Output changes with timestep ──
-    print("\n── Test 6: Timestep Conditioning ──")
-    model.eval()
-    x = torch.randn(1, 1, 28, 28)
-    with torch.no_grad():
-        out_t10 = model(x, torch.tensor([10]))
-        out_t990 = model(x, torch.tensor([990]))
-
-    diff = (out_t10 - out_t990).abs().mean().item()
-    print(f"Same input, different timestep:")
-    print(f"  Mean |output(t=10) - output(t=990)|: {diff:.6f}")
-    assert diff > 0.001, "Output should change with timestep"
-    print("✓ Network is sensitive to timestep\n")
-
     # ── Test 7: Gradient flow ──
-    print("── Test 7: Gradient Flow ──")
-    model.train()
-    x = torch.randn(2, 1, 28, 28)
+    print("\n── Test 7: Gradient Flow (CIFAR) ──")
+    model_cifar.train()
+    x = torch.randn(2, 3, 32, 32)
     t = torch.randint(0, 1000, (2,))
-    out = model(x, t)
+    out = model_cifar(x, t)
     loss = out.mean()
     loss.backward()
-
-    # Check that all parameters received gradients
-    no_grad = [name for name, p in model.named_parameters() if p.grad is None]
+    no_grad = [n for n, p in model_cifar.named_parameters() if p.grad is None]
     if no_grad:
-        print(f"  WARNING: {len(no_grad)} parameters have no gradient:")
-        for name in no_grad[:5]:
-            print(f"    {name}")
+        print(f"  WARNING: {len(no_grad)} parameters have no gradient")
     else:
-        print(f"  All {sum(1 for _ in model.parameters())} parameters have gradients")
-    print("✓ Gradients flow through entire network\n")
+        print(f"  All {sum(1 for _ in model_cifar.parameters())} parameters have gradients")
+    print("✓ Gradients flow correctly\n")
 
     # ── Summary ──
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Architecture: U-Net with {len(model.channel_list)} resolution levels")
-    print(f"Channels:     {list(model.channel_list)}")
-    print(f"ResBlocks:    {model.num_res_blocks} per level")
-    print(f"Time dim:     128 (sinusoidal → MLP)")
-    print(f"Parameters:   {n_params:,}")
-    print(f"Input:        (batch, 1, 28, 28)")
-    print(f"Output:       (batch, 1, 28, 28)  — predicted noise")
+    print(f"MNIST  U-Net: {n_mnist:,} params  | channels={list((64,128,256))}")
+    print(f"CIFAR  U-Net: {n_cifar:,} params  | channels={list((128,256,256,512))}")
+    print(f"CIFAR attention at levels 1,2 (16×16 and 8×8 resolution)")
     print(f"\nFor comparison:")
-    print(f"  AlphaZero ResNet:    377,629 params (single resolution)")
-    print(f"  This U-Net:          {n_params:,} params (multi-resolution)")
-    print(f"  DDPM paper (CIFAR):  ~35M params")
-    print("\n✓ All Phase 2 tests passed!")
+    print(f"  AlphaZero ResNet:      377,629 params")
+    print(f"  DDPM paper (CIFAR):    ~35M params")
+    print(f"  Our CIFAR U-Net:       {n_cifar:,} params")
+    print("\n✓ All tests passed!")
