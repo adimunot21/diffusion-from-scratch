@@ -572,4 +572,4 @@ def _guidance_comparison(model, schedule, device):
 # -----------------------------------------------------------------------
 
 if __name__ == "__main__":
-    train_conditional()
+    train_conditional() 
