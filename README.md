@@ -33,18 +33,18 @@ Three components, each built from first principles:
 
 ## Results
 
-### MNIST Samples (50 epochs, 4.5M params)
+### MNIST Samples (50 epochs, 9.53M params)
 Clean, diverse handwritten digits generated from pure noise.
 
-### CIFAR-10 Conditional Samples (100 epochs, 28M params)
+### CIFAR-10 Conditional Samples (100 epochs, 46.03M params)
 Class-conditional generation with classifier-free guidance (w=5.0). Each class generates recognizable objects with correct colors and compositions.
 
 ### FID Scores
 | Model | FID | Parameters |
 |-------|-----|-----------|
-| MNIST (DDIM 50 steps) | **34.1** | 4.5M |
-| CIFAR-10 Unconditional | **71.2** | 28M |
-| CIFAR-10 Conditional (w=5.0) | **65.3** | 28M |
+| MNIST (DDIM 50 steps) | **34.1** | 9.53M |
+| CIFAR-10 Unconditional | **71.2** | 46.03M |
+| CIFAR-10 Conditional (w=5.0) | **65.3** | 46.03M |
 | Reference: DDPM paper (800 epochs) | 3.17 | 35M |
 
 Guidance improves FID (65.3 < 71.2), confirming it genuinely increases quality.
@@ -55,9 +55,38 @@ Guidance improves FID (65.3 < 71.2), confirming it genuinely increases quality.
 - **Deterministic DDIM enables interpolation**: smooth morphing between digits in noise space
 - **Cosine schedule preserves fine detail**: better than linear for RGB images
 
+## Trained Weights
+
+All three trained models are published on the Hugging Face Hub:
+**[adimunot/diffusion-from-scratch](https://huggingface.co/adimunot/diffusion-from-scratch)**
+
+| Folder | Model | Params | FID |
+|---|---|---|---|
+| `mnist/` | MNIST, unconditional | 9.53M | 34.1 |
+| `cifar10_uncond/` | CIFAR-10, unconditional | 46.03M | 71.2 |
+| `cifar10_cond/` | CIFAR-10, class-conditional | 46.03M | 65.3 |
+
+Each folder contains `ema.safetensors` (exponential moving average of the weights —
+**use these for sampling**), `model.safetensors` (raw final training weights) and a
+`config.json` holding the exact hyperparameters that checkpoint was trained with.
+
+```python
+import json
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+
+repo = "adimunot/diffusion-from-scratch"
+cfg  = json.load(open(hf_hub_download(repo, "cifar10_uncond/config.json")))
+path = hf_hub_download(repo, "cifar10_uncond/ema.safetensors")
+
+model = UNet(**cfg)              # architecture args come straight from config.json
+model.load_state_dict(load_file(path))
+model.eval()
+```
+
 ## Architecture
 
-### U-Net (MNIST — 4.5M params)
+### U-Net (MNIST — 9.53M params)
 ```
 Input: 1×28×28 → ConvBlock → 64×28×28
   → Encoder: [64, 128, 256] with ResBlocks, downsample 28→14→7
@@ -67,7 +96,7 @@ Input: 1×28×28 → ConvBlock → 64×28×28
 Time conditioning: sinusoidal embedding → MLP → injected into every ResBlock
 ```
 
-### U-Net (CIFAR-10 — 28M params)
+### U-Net (CIFAR-10 — 46.03M params)
 ```
 Input: 3×32×32 → ConvBlock → 128×32×32
   → Encoder: [128, 256, 256, 512] with ResBlocks + attention at 16×16 and 8×8
